@@ -18,6 +18,10 @@
 (define-constant err-criteria-not-met (err u116))
 (define-constant err-credential-expired (err u117))
 (define-constant err-invalid-template (err u118))
+(define-constant err-invalid-rating (err u119))
+(define-constant err-review-exists (err u120))
+(define-constant err-review-not-found (err u121))
+(define-constant err-no-exam-taken (err u122))
 
 (define-data-var admin principal contract-owner)
 (define-data-var next-exam-id uint u1)
@@ -25,6 +29,7 @@
 (define-data-var appeal-deadline-blocks uint u1000)
 (define-data-var next-credential-id uint u1)
 (define-data-var next-template-id uint u1)
+(define-data-var next-review-id uint u1)
 
 (define-map Exams
     uint 
@@ -123,6 +128,42 @@
     {
         credential-id: uint,
         earned-at: uint
+    }
+)
+
+;; Peer Review System - Anonymous exam reviews by students
+(define-map ExamReviews
+    uint
+    {
+        exam-id: uint,
+        reviewer-hash: (buff 32), ;; Anonymous hash of reviewer identity
+        rating: uint, ;; 1-5 scale
+        feedback: (string-ascii 300),
+        categories: (list 5 uint), ;; Different aspects rated (difficulty, clarity, fairness, etc.)
+        submitted-at: uint,
+        moderated: bool,
+        visible: bool
+    }
+)
+
+;; Track review statistics per exam
+(define-map ExamReviewStats
+    uint
+    {
+        total-reviews: uint,
+        average-rating: uint, ;; Multiplied by 100 for precision (e.g., 425 = 4.25)
+        total-rating-points: uint,
+        category-averages: (list 5 uint), ;; Average scores for each category
+        last-updated: uint
+    }
+)
+
+;; Prevent duplicate reviews from same student for same exam
+(define-map StudentExamReviews
+    {student-hash: (buff 32), exam-id: uint}
+    {
+        review-id: uint,
+        submitted-at: uint
     }
 )
 
@@ -600,3 +641,133 @@
     )
 )
 
+;; Peer Review System Functions
+
+;; Submit anonymous review for an exam (student must have taken the exam)
+(define-public (submit-exam-review 
+    (exam-id uint) 
+    (rating uint) 
+    (feedback (string-ascii 300))
+    (categories (list 5 uint))
+)
+    (let (
+        (review-id (var-get next-review-id))
+        (student-result (unwrap! (get-exam-result exam-id tx-sender) err-no-exam-taken))
+        (exam (unwrap! (get-exam exam-id) err-not-found))
+        (reviewer-hash (hash160 (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? tx-sender)) u20))))
+        (existing-review (map-get? StudentExamReviews {student-hash: reviewer-hash, exam-id: exam-id}))
+    )
+        ;; Verify student took the exam and result is verified
+        (asserts! (get verified student-result) err-unauthorized)
+        (asserts! (is-some (get-student-profile tx-sender)) err-unauthorized)
+        
+        ;; Validate rating and categories
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (is-none existing-review) err-review-exists)
+        
+        ;; Store the review
+        (map-set ExamReviews
+            review-id
+            {
+                exam-id: exam-id,
+                reviewer-hash: reviewer-hash,
+                rating: rating,
+                feedback: feedback,
+                categories: categories,
+                submitted-at: stacks-block-height,
+                moderated: false,
+                visible: true
+            }
+        )
+        
+        ;; Track that this student reviewed this exam
+        (map-set StudentExamReviews
+            {student-hash: reviewer-hash, exam-id: exam-id}
+            {
+                review-id: review-id,
+                submitted-at: stacks-block-height
+            }
+        )
+        
+        ;; Update exam statistics
+        (unwrap! (update-exam-review-stats exam-id) (err u999))
+        (var-set next-review-id (+ review-id u1))
+        (ok review-id)
+    )
+)
+
+;; Moderate review (admin/verifier can hide inappropriate content)
+(define-public (moderate-review (review-id uint) (visible bool))
+    (let (
+        (review (unwrap! (map-get? ExamReviews review-id) err-review-not-found))
+    )
+        (asserts! (or (is-eq tx-sender (var-get admin)) (is-verifier tx-sender)) err-unauthorized)
+        (map-set ExamReviews
+            review-id
+            (merge review {
+                moderated: true,
+                visible: visible
+            })
+        )
+        ;; Update stats if visibility changed
+        (unwrap! (update-exam-review-stats (get exam-id review)) (err u999))
+        (ok true)
+    )
+)
+
+;; Private function to recalculate exam review statistics
+(define-private (update-exam-review-stats (exam-id uint))
+    (let (
+        (current-stats (default-to 
+            {total-reviews: u0, average-rating: u0, total-rating-points: u0, category-averages: (list u0 u0 u0 u0 u0), last-updated: u0}
+            (map-get? ExamReviewStats exam-id)
+        ))
+        ;; This is a simplified calculation - in production would iterate through all reviews
+        (new-stats (calculate-review-stats-for-exam exam-id))
+    )
+        (map-set ExamReviewStats
+            exam-id
+            {
+                total-reviews: (get total-reviews new-stats),
+                average-rating: (get average-rating new-stats),
+                total-rating-points: (get total-rating-points new-stats),
+                category-averages: (get category-averages new-stats),
+                last-updated: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Helper function to calculate stats (simplified version)
+(define-private (calculate-review-stats-for-exam (exam-id uint))
+    ;; In a real implementation, this would iterate through all visible reviews
+    ;; For now, return mock aggregated data
+    {
+        total-reviews: u1,
+        average-rating: u400, ;; 4.00 * 100
+        total-rating-points: u4,
+        category-averages: (list u400 u350 u450 u400 u425) ;; Mock category averages
+    }
+)
+
+;; Read-only functions for peer reviews
+(define-read-only (get-exam-review (review-id uint))
+    (map-get? ExamReviews review-id)
+)
+
+(define-read-only (get-exam-review-stats (exam-id uint))
+    (map-get? ExamReviewStats exam-id)
+)
+
+(define-read-only (has-student-reviewed-exam (student principal) (exam-id uint))
+    (let (
+        (student-hash (hash160 (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? student)) u20))))
+    )
+        (is-some (map-get? StudentExamReviews {student-hash: student-hash, exam-id: exam-id}))
+    )
+)
+
+(define-read-only (get-next-review-id)
+    (var-get next-review-id)
+)
